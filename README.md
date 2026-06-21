@@ -266,7 +266,7 @@ npm test   # runs 19 tests with node:test (no extra deps)
 
 **To add a generated-file pattern:** add a regex to `GEN_FILE` or a directory name to `GEN_DIRS` in [`src/core.js`](src/core.js).
 
-Found a bug or want a missing pattern? Open an issue: [github.com/dassamrat11/ai-readability/issues](https://github.com/dassamrat11/ai-readability/issues)
+Found a bug or want a missing pattern? Open an issue: [github.com/thesamratdas/ai-readability/issues](https://github.com/thesamratdas/ai-readability/issues)
 
 ## License
 

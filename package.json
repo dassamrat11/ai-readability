@@ -1,6 +1,6 @@
 {
   "name": "ai-readability",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Score how AI-readable a codebase is — offline, no keys needed.",
   "type": "module",
   "main": "src/index.js",
@@ -32,11 +32,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dassamrat11/ai-readability.git"
+    "url": "git+https://github.com/thesamratdas/ai-readability.git"
   },
-  "homepage": "https://github.com/dassamrat11/ai-readability#readme",
+  "homepage": "https://github.com/thesamratdas/ai-readability#readme",
   "bugs": {
-    "url": "https://github.com/dassamrat11/ai-readability/issues"
+    "url": "https://github.com/thesamratdas/ai-readability/issues"
   },
   "dependencies": {
     "gpt-tokenizer": "^3.4.0",
