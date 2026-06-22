@@ -106,6 +106,40 @@ export function walk(dir, ignore = [], out = [], _root) {
   return out;
 }
 
+// ── fix helpers (exported so CLI, extension, and tests share one implementation) ─
+
+// Classifies a file as needing exclusion.
+// A/B-grade files (value >= 75) are intentionally good — never flag as token-hogs.
+export function reasonFor(r, total) {
+  if (isGenerated(r.file))                      return 'generated';
+  if (r.value < 45)                             return 'low-signal (F)';
+  if (r.value < 60)                             return 'low-signal (D)';
+  if (r.tokens / total > 0.10 && r.value < 75) return 'token-hog (' + Math.round(r.tokens / total * 100) + '%)';
+  return null;
+}
+
+// Returns deduplicated .aiignore patterns derived from the flagged subset only.
+export function computePatterns(files, total) {
+  const flagged = files.filter(f => reasonFor(f, total) !== null);
+  return [...new Set(flagged.map(r => {
+    const dir = r.file.replace(/\\/g, '/').split('/').find(s => GEN_DIRS.has(s));
+    return dir ? dir + '/' : r.file.replace(/\\/g, '/');
+  }))];
+}
+
+// Appends new patterns to dest, skipping any already present.
+// Never adds blank lines between existing and new entries.
+// Returns the count of newly written patterns (0 = already up to date).
+export function writeAiignore(dest, patterns) {
+  const raw = fs.existsSync(dest) ? fs.readFileSync(dest, 'utf8') : '';
+  const existing = raw.split('\n').map(l => l.trim()).filter(Boolean);
+  const toAdd = patterns.filter(p => !existing.includes(p));
+  if (!toAdd.length) return 0;
+  const sep = raw.length > 0 && !raw.endsWith('\n') ? '\n' : '';
+  fs.appendFileSync(dest, sep + toAdd.join('\n') + '\n');
+  return toAdd.length;
+}
+
 export function scoreRepo(dir, { ignorePatterns = [] } = {}) {
   const ignore = [...loadIgnore(dir), ...ignorePatterns];
   const files  = walk(dir, ignore);

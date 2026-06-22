@@ -1,7 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { scoreText, isGenerated, gradeOf, scoreRepo } from '../src/core.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { scoreText, isGenerated, gradeOf, scoreRepo, reasonFor, computePatterns, writeAiignore } from '../src/core.js';
 import { MODELS } from '../src/pricing.js';
 
 // ── grade determinism ─────────────────────────────────────────────────────────
@@ -132,4 +135,101 @@ test('scoreRepo on its own src/ returns a valid result object', () => {
   assert.ok(Array.isArray(result.files),        'files is array');
   assert.ok(result.files.length > 0,            'found at least one file');
   assert.ok(result.scannedAt,                   'scannedAt is set');
+});
+
+// ── reasonFor grade guard ─────────────────────────────────────────────────────
+
+test('reasonFor: A-grade file is never flagged as token-hog', () => {
+  // value=95 → grade A; tokens=2000/10000 = 20% > threshold
+  const file = { file: 'src/big.ts', value: 95, tokens: 2000 };
+  assert.equal(reasonFor(file, 10000), null, 'A-grade must not be flagged');
+});
+
+test('reasonFor: B-grade file is never flagged as token-hog', () => {
+  const file = { file: 'src/medium.ts', value: 80, tokens: 2000 };
+  assert.equal(reasonFor(file, 10000), null, 'B-grade must not be flagged');
+});
+
+test('reasonFor: C-grade large file IS flagged as token-hog', () => {
+  // value=65 → grade C; 20% of total
+  const file = { file: 'src/noisy.ts', value: 65, tokens: 2000 };
+  assert.ok(reasonFor(file, 10000) !== null, 'C-grade token-hog must be flagged');
+});
+
+test('reasonFor: low-signal F-grade file is flagged regardless of size', () => {
+  const file = { file: 'src/minified.js', value: 30, tokens: 50 };
+  assert.equal(reasonFor(file, 10000), 'low-signal (F)');
+});
+
+test('reasonFor: generated file is always flagged regardless of grade', () => {
+  // A-grade score but lives in dist/ → generated
+  const file = { file: 'dist/bundle.js', value: 95, tokens: 10 };
+  assert.equal(reasonFor(file, 10000), 'generated');
+});
+
+// ── writeAiignore idempotency ─────────────────────────────────────────────────
+
+test('writeAiignore: second run adds zero lines and file is byte-identical', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-readability-fix-'));
+  try {
+    // vendor/ is in GEN_DIRS but NOT in the walk SKIP set, so scoreRepo will
+    // visit it and reasonFor will return 'generated' for those files.
+    const vendorDir = path.join(tmpDir, 'vendor');
+    fs.mkdirSync(vendorDir);
+    fs.writeFileSync(
+      path.join(vendorDir, 'jquery.js'),
+      '(function(){var x=1;})();\n'.repeat(200),
+    );
+    // A clean source file that must NOT be flagged
+    fs.writeFileSync(
+      path.join(tmpDir, 'index.js'),
+      'export function greet(name) {\n  return `Hello, ${name}!`;\n}\n',
+    );
+
+    const { total, files } = scoreRepo(tmpDir);
+    const patterns = computePatterns(files, total);
+    assert.ok(patterns.length > 0, 'fixture must produce at least one pattern');
+
+    const dest = path.join(tmpDir, '.aiignore');
+
+    const added1 = writeAiignore(dest, patterns);
+    assert.ok(added1 > 0, 'first run must write patterns');
+    const content1 = fs.readFileSync(dest, 'utf8');
+
+    const added2 = writeAiignore(dest, patterns);
+    assert.equal(added2, 0, 'second run must add nothing');
+    const content2 = fs.readFileSync(dest, 'utf8');
+
+    assert.equal(content1, content2, 'file must be byte-identical after second run');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('writeAiignore: deduplicates and never inserts blank lines', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-readability-dedup-'));
+  try {
+    const dest = path.join(tmpDir, '.aiignore');
+    fs.writeFileSync(dest, 'dist/\n');
+
+    const added = writeAiignore(dest, ['dist/', 'build/']);
+    assert.equal(added, 1, 'only the new pattern should be added');
+
+    const content = fs.readFileSync(dest, 'utf8');
+    assert.equal(content, 'dist/\nbuild/\n', 'no blank line between existing and new pattern');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('computePatterns: excludes A/B-grade source files even when large', () => {
+  // Synthetic file list: one A-grade large file, one generated file
+  const total = 10000;
+  const files = [
+    { file: 'src/main.ts',    value: 92, tokens: 3000, grade: 'A' }, // 30% but A-grade
+    { file: 'dist/bundle.js', value: 80, tokens: 5000, grade: 'B' }, // generated → must be included
+  ];
+  const patterns = computePatterns(files, total);
+  assert.ok(!patterns.includes('src/main.ts'),  'A-grade source file must NOT appear in patterns');
+  assert.ok(patterns.includes('dist/'),          'generated dist/ must appear in patterns');
 });

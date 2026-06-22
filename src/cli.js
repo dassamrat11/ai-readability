@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { scoreText, isGenerated, walk, gradeOf, loadIgnore, GEN_DIRS } from './core.js';
+import { scoreText, isGenerated, walk, gradeOf, loadIgnore, GEN_DIRS, reasonFor, computePatterns, writeAiignore } from './core.js';
 import { MODELS, SUMMARY_MODELS } from './pricing.js';
 import { makeBadge } from './badge.js';
 import fs   from 'node:fs';
@@ -103,14 +103,6 @@ const fmt    = n => n.toLocaleString();
 const pct    = (n, t) => t ? ((n / t) * 100).toFixed(0).padStart(3) + '%' : '  0%';
 const dollar = n => ('$' + Math.abs(n).toFixed(3)).padStart(7);
 
-// ── reason classifier ─────────────────────────────────────────────────────────
-function reasonFor(r, total) {
-  if (isGenerated(r.file))         return 'generated';
-  if (r.value < 45)                return 'low-signal (F)';
-  if (r.value < 60)                return 'low-signal (D)';
-  if (r.tokens / total > 0.10)     return `token-hog (${Math.round(r.tokens / total * 100)}%)`;
-  return null;
-}
 
 // ── context fit (3-model summary always shown under the grade line) ────────────
 function contextFit(tokens, label) {
@@ -272,25 +264,18 @@ function render() {
     console.log(`    ${kleur.dim(tag)}  ${String(r.tokens).padStart(7)} tok  ${r.file}`);
   });
 
-  const patterns = [...new Set(flagged.map(r => {
-    const dir = r.file.replace(/\\/g, '/').split('/').find(s => GEN_DIRS.has(s));
-    return dir ? dir + '/' : r.file.replace(/\\/g, '/');
-  }))];
+  const patterns = computePatterns(rows, total);
 
   console.log('\n  ' + kleur.bold('📋 Paste into .aiignore / .cursorignore:'));
   patterns.forEach(p => console.log('    ' + kleur.green(p)));
 
   if (doFix) {
-    const dest     = path.join(root, '.aiignore');
-    const existing = fs.existsSync(dest)
-      ? fs.readFileSync(dest, 'utf8').split('\n').map(l => l.trim()).filter(Boolean)
-      : [];
-    const toAdd = patterns.filter(p => !existing.includes(p));
-    if (toAdd.length) {
-      fs.appendFileSync(dest, (existing.length ? '\n' : '') + toAdd.join('\n') + '\n');
-      console.log('\n  ' + kleur.green(`✅  Wrote ${toAdd.length} pattern(s) to .aiignore`));
+    const dest  = path.join(root, '.aiignore');
+    const added = writeAiignore(dest, patterns);
+    if (added) {
+      console.log('\n  ' + kleur.green(`✅  Wrote ${added} pattern(s) to .aiignore`));
     } else {
-      console.log('\n  ' + kleur.dim('Already up to date — .aiignore unchanged.'));
+      console.log('\n  ' + kleur.dim('Nothing to update — already optimized.'));
     }
   } else {
     console.log('\n  ' + kleur.dim('Tip: run with --fix to write .aiignore automatically.'));
