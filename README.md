@@ -111,7 +111,8 @@ Each file is scored 0–100 across three dimensions, then token-weighted into a 
 
 Files are flagged `[generated]` when they match known build directories or filename patterns:
 
-- **Directories skipped entirely:** `dist/`, `build/`, `out/`, `coverage/`, `.next/`, `.nuxt/`, `playwright-report/`, `test-results/`, `__pycache__/`, `vendor/`, and more
+- **Directories never traversed:** `node_modules/`, `.git/`, `dist/`, `build/`, `.next/`, `coverage/` — `walk()` never enters these
+- **Directories traversed but flagged as generated:** `out/`, `.nuxt/`, `target/`, `bin/`, `obj/`, `playwright-report/`, `test-results/`, `__pycache__/`, `vendor/`, and more — their files appear in the token breakdown and count toward the repo total, but are always marked `[generated]` and recommended for exclusion
 - **Lock files:** `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, any `*.lock`
 - **Minified / compiled assets:** `*.min.js`, `*.min.css`, `*.bundle.js`, `*.map`, `*.generated.*`
 
@@ -259,7 +260,7 @@ Node.js 16 or later. No API keys. No network.
 ## Contributing
 
 ```bash
-npm test   # runs 19 tests with node:test (no extra deps)
+npm test   # runs 27 tests with node:test (no extra deps)
 ```
 
 **To add a model or update prices:** edit [`src/pricing.js`](src/pricing.js) and update the `// prices as of YYYY-MM` date at the top.
