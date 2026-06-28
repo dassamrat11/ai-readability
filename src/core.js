@@ -55,52 +55,127 @@ export function isGenerated(rel) {
   return GEN_FILE.some(re => re.test(parts[parts.length - 1]));
 }
 
-export function loadIgnore(root) {
-  const p = path.join(root, '.aiignore');
-  if (!fs.existsSync(p)) return [];
-  return fs.readFileSync(p, 'utf8')
+function readPatternFile(file) {
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, 'utf8')
     .split('\n')
     .map(l => l.trim())
-    .filter(l => l && !l.startsWith('#'));
+    // Skip comments, blanks, and negations (`!` re-include is unsupported —
+    // ignoring it errs toward scanning more, never less).
+    .filter(l => l && !l.startsWith('#') && !l.startsWith('!'));
 }
 
+export function loadIgnore(root) {
+  return readPatternFile(path.join(root, '.aiignore'));
+}
+
+// Root-level .gitignore patterns. Opt-in: most generated junk is already
+// gitignored, so honoring it models what a .gitignore-aware AI tool ingests.
+export function loadGitignore(root) {
+  return readPatternFile(path.join(root, '.gitignore'));
+}
+
+function globToRegex(glob) {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*') {
+      if (glob[i + 1] === '*') { re += '.*'; i++; }
+      else re += '[^/]*';
+    } else if (c === '?') {
+      re += '[^/]';
+    } else {
+      re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  return re;
+}
+
+// Minimal .gitignore-style matcher: handles dir (`build/`), root-anchored
+// (`/dist`), basename (`*.log`, `package-lock.json`) and nested-path patterns.
 function matchIgnore(rel, patterns) {
   const norm = rel.replace(/\\/g, '/');
-  for (const pat of patterns) {
-    if (pat.endsWith('/')) {
-      const d = pat.slice(0, -1);
-      if (norm === d || norm.startsWith(d + '/')) return true;
-    } else if (norm === pat || path.basename(norm) === pat) {
-      return true;
+  const base = norm.slice(norm.lastIndexOf('/') + 1);
+  const segs = norm.split('/');
+  for (let pat of patterns) {
+    let p = pat.replace(/\\/g, '/');
+    const dirOnly = p.endsWith('/');
+    if (dirOnly) p = p.slice(0, -1);
+    const anchored = p.startsWith('/');
+    if (anchored) p = p.slice(1);
+    if (!p) continue;
+
+    const isGlob = p.includes('*') || p.includes('?');
+    const hasSlash = p.includes('/');
+
+    if (!isGlob) {
+      if (dirOnly) {
+        if (norm === p || norm.startsWith(p + '/')) return true;
+        if (!anchored && segs.slice(0, -1).includes(p)) return true;
+      } else {
+        if (norm === p) return true;
+        if (!anchored && !hasSlash && base === p) return true;
+        if (!anchored && hasSlash && norm.endsWith('/' + p)) return true;
+      }
+      continue;
+    }
+
+    const re = new RegExp('^' + globToRegex(p) + (dirOnly ? '(?:/.*)?$' : '$'));
+    if (anchored || hasSlash) {
+      if (re.test(norm)) return true;
+    } else {
+      if (re.test(base)) return true;
+      if (dirOnly && segs.some(s => re.test(s))) return true;
     }
   }
   return false;
 }
 
-const SKIP = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'coverage', '.claude', '.cursor']);
+const SKIP = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'coverage', '.claude', '.cursor', '.ai']);
 
 const TEXT = new Set([
-  '.js', '.ts', '.jsx', '.tsx',
-  '.json', '.jsonc',
-  '.md', '.mdx', '.txt',
-  '.py', '.java', '.html', '.css', '.scss', '.sass',
-  '.yml', '.yaml', '.toml', '.ini', '.env',
-  '.go', '.rs', '.rb', '.php', '.sh', '.bash', '.zsh',
-  '.c', '.cpp', '.h', '.cs', '.swift', '.kt',
-  '.sql', '.graphql', '.prisma',
-  '.vue', '.svelte',
+  '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs', '.mts', '.cts',
+  '.json', '.jsonc', '.json5',
+  '.md', '.mdx', '.txt', '.rst', '.adoc',
+  '.py', '.pyi', '.java', '.html', '.htm', '.css', '.scss', '.sass', '.less',
+  '.yml', '.yaml', '.toml', '.ini', '.env', '.cfg', '.conf', '.properties',
+  '.go', '.rs', '.rb', '.php', '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat',
+  '.c', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.cs', '.swift', '.kt', '.kts', '.m', '.mm',
+  '.scala', '.clj', '.cljs', '.cljc', '.ex', '.exs', '.erl', '.hs', '.ml', '.fs', '.fsx',
+  '.dart', '.lua', '.pl', '.pm', '.r', '.jl', '.groovy', '.gradle',
+  '.sql', '.graphql', '.gql', '.prisma', '.proto',
+  '.vue', '.svelte', '.astro',
+  '.xml', '.csv', '.tsv', '.tf', '.tfvars', '.hcl', '.dockerfile', '.makefile',
 ]);
 
-export function walk(dir, ignore = [], out = [], _root) {
+// Extension-less files that are still source/config worth scoring.
+const TEXT_NAMES = new Set([
+  'Dockerfile', 'Makefile', 'Rakefile', 'Gemfile', 'Procfile', 'Brewfile',
+  'Jenkinsfile', 'Vagrantfile', 'LICENSE', 'CODEOWNERS', '.gitignore',
+  '.gitattributes', '.dockerignore', '.editorconfig', '.npmrc', '.nvmrc',
+  '.babelrc', '.prettierrc', '.eslintrc',
+]);
+
+// Files larger than this are skipped to avoid OOM/UI freezes on data dumps.
+// Real-world source files are virtually always well under 2 MB.
+export const DEFAULT_MAX_BYTES = 2_000_000;
+
+export function isTextFile(name) {
+  return TEXT.has(path.extname(name).toLowerCase()) || TEXT_NAMES.has(name);
+}
+
+export function walk(dir, ignore = [], out = [], _root, maxBytes = DEFAULT_MAX_BYTES) {
   const root = _root ?? dir;
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const p   = path.join(dir, e.name);
     const rel = path.relative(root, p);
     if (matchIgnore(rel, ignore)) continue;
     if (e.isDirectory()) {
-      if (!SKIP.has(e.name)) walk(p, ignore, out, root);
-    } else if (TEXT.has(path.extname(e.name).toLowerCase())) {
-      out.push(p);
+      if (!SKIP.has(e.name)) walk(p, ignore, out, root, maxBytes);
+    } else if (isTextFile(e.name)) {
+      try {
+        if (fs.statSync(p).size <= maxBytes) out.push(p);
+      } catch { /* unreadable / vanished file — skip */ }
     }
   }
   return out;
@@ -140,9 +215,13 @@ export function writeAiignore(dest, patterns) {
   return toAdd.length;
 }
 
-export function scoreRepo(dir, { ignorePatterns = [] } = {}) {
-  const ignore = [...loadIgnore(dir), ...ignorePatterns];
-  const files  = walk(dir, ignore);
+export function scoreRepo(dir, { ignorePatterns = [], respectGitignore = false, maxBytes = DEFAULT_MAX_BYTES } = {}) {
+  const ignore = [
+    ...loadIgnore(dir),
+    ...(respectGitignore ? loadGitignore(dir) : []),
+    ...ignorePatterns,
+  ];
+  const files  = walk(dir, ignore, [], undefined, maxBytes);
   if (!files.length) {
     return { root: dir, scannedAt: new Date().toISOString(), total: 0, score: 0, grade: 'F', files: [] };
   }

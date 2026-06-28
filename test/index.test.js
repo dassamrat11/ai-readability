@@ -4,8 +4,9 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { scoreText, isGenerated, gradeOf, scoreRepo, reasonFor, computePatterns, writeAiignore } from '../src/core.js';
-import { MODELS } from '../src/pricing.js';
+import { scoreText, isGenerated, isTextFile, gradeOf, scoreRepo, reasonFor, computePatterns, writeAiignore } from '../src/core.js';
+import { MODELS, effectiveTokens, TOKEN_FACTOR } from '../src/pricing.js';
+import { extractSkeleton, buildImportGraph, distillRepo, writeSummaries } from '../src/distill.js';
 
 // ── grade determinism ─────────────────────────────────────────────────────────
 
@@ -222,6 +223,77 @@ test('writeAiignore: deduplicates and never inserts blank lines', () => {
   }
 });
 
+// ── isTextFile (extensions + extension-less names) ─────────────────────────────
+
+test('isTextFile: recognizes new extensions and extension-less names', () => {
+  assert.equal(isTextFile('worker.mjs'), true);
+  assert.equal(isTextFile('main.tf'), true);
+  assert.equal(isTextFile('schema.proto'), true);
+  assert.equal(isTextFile('Dockerfile'), true);
+  assert.equal(isTextFile('Makefile'), true);
+  assert.equal(isTextFile('photo.png'), false);
+  assert.equal(isTextFile('archive.zip'), false);
+});
+
+// ── effectiveTokens (cross-tokenizer correction) ───────────────────────────────
+
+test('effectiveTokens: OpenAI is identity, Anthropic/Google scale up', () => {
+  const openai    = MODELS.find(m => m.provider === 'OpenAI');
+  const anthropic = MODELS.find(m => m.provider === 'Anthropic');
+  const google    = MODELS.find(m => m.provider === 'Google');
+  assert.equal(effectiveTokens(1000, openai), 1000);
+  assert.equal(effectiveTokens(1000, anthropic), Math.round(1000 * TOKEN_FACTOR.Anthropic));
+  assert.equal(effectiveTokens(1000, google), Math.round(1000 * TOKEN_FACTOR.Google));
+  assert.ok(effectiveTokens(1000, anthropic) > 1000, 'Claude must count more tokens');
+});
+
+test('every model carries a positive tokenFactor', () => {
+  for (const m of MODELS) {
+    assert.ok(typeof m.tokenFactor === 'number' && m.tokenFactor > 0, `${m.name}: tokenFactor`);
+  }
+});
+
+// ── .gitignore support + glob matching ─────────────────────────────────────────
+
+test('scoreRepo: respectGitignore excludes gitignored files, default keeps them', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-readability-gi-'));
+  try {
+    fs.writeFileSync(path.join(tmpDir, '.gitignore'), 'secret.js\n*.log\nbuilt/\n');
+    fs.writeFileSync(path.join(tmpDir, 'index.js'), 'export const a = 1;\n');
+    fs.writeFileSync(path.join(tmpDir, 'secret.js'), 'export const key = "x";\n');
+    fs.writeFileSync(path.join(tmpDir, 'debug.log'), 'noise\n'.repeat(50));
+    fs.mkdirSync(path.join(tmpDir, 'built'));
+    fs.writeFileSync(path.join(tmpDir, 'built', 'out.js'), 'var x=1;\n');
+
+    const withGi = scoreRepo(tmpDir, { respectGitignore: true });
+    const files  = withGi.files.map(f => f.file.replace(/\\/g, '/'));
+    assert.ok(files.includes('index.js'), 'kept file present');
+    assert.ok(!files.includes('secret.js'), 'gitignored basename excluded');
+    assert.ok(!files.includes('debug.log'), 'gitignored glob excluded');
+    assert.ok(!files.some(f => f.startsWith('built/')), 'gitignored dir excluded');
+
+    const without = scoreRepo(tmpDir, { respectGitignore: false });
+    const all = without.files.map(f => f.file.replace(/\\/g, '/'));
+    assert.ok(all.includes('secret.js'), 'default scan keeps gitignored file');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('scoreRepo: maxBytes skips oversized files', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-readability-big-'));
+  try {
+    fs.writeFileSync(path.join(tmpDir, 'small.js'), 'export const a = 1;\n');
+    fs.writeFileSync(path.join(tmpDir, 'huge.js'), 'x'.repeat(5000));
+    const r = scoreRepo(tmpDir, { maxBytes: 1000 });
+    const files = r.files.map(f => f.file.replace(/\\/g, '/'));
+    assert.ok(files.includes('small.js'), 'small file kept');
+    assert.ok(!files.includes('huge.js'), 'oversized file skipped');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('computePatterns: excludes A/B-grade source files even when large', () => {
   // Synthetic file list: one A-grade large file, one generated file
   const total = 10000;
@@ -232,4 +304,69 @@ test('computePatterns: excludes A/B-grade source files even when large', () => {
   const patterns = computePatterns(files, total);
   assert.ok(!patterns.includes('src/main.ts'),  'A-grade source file must NOT appear in patterns');
   assert.ok(patterns.includes('dist/'),          'generated dist/ must appear in patterns');
+});
+
+// ── distill: skeleton extraction ───────────────────────────────────────────────
+
+test('extractSkeleton (JS): keeps API, drops bodies, skips private members', () => {
+  const src = [
+    '/** Banner doc. */',
+    "import x from './x.js';",
+    'export function greet(name) {',
+    '  const secret = 42;',
+    '  return `hi ${name} ${secret}`;',
+    '}',
+    'export class Service {',
+    '  publicMethod(a) { return a + 1; }',
+    '  private hidden() { return 99; }',
+    '}',
+    'export interface Opts { id: number; name: string; }',
+    'function internalHelper() { return 1; }',
+  ].join('\n');
+  const sk = extractSkeleton(src, '.js');
+  assert.ok(sk.includes('export function greet(name)'), 'keeps exported function signature');
+  assert.ok(sk.includes('{ … }'), 'replaces body with elision marker');
+  assert.ok(!sk.includes('secret = 42'), 'drops implementation detail');
+  assert.ok(sk.includes('publicMethod'), 'keeps public method signature');
+  assert.ok(!sk.includes('hidden'), 'skips private member');
+  assert.ok(sk.includes('id: number'), 'keeps interface body (the contract)');
+  assert.ok(sk.includes('Banner doc'), 'keeps banner doc comment');
+});
+
+test('buildImportGraph: counts fan-in across relative imports', () => {
+  const infos = [
+    { rel: 'util.js',  ext: '.js', text: 'export const a = 1;' },
+    { rel: 'a.js',     ext: '.js', text: "import { a } from './util.js';" },
+    { rel: 'b.js',     ext: '.js', text: "import { a } from './util';" }, // extensionless
+    { rel: 'c.js',     ext: '.js', text: "const x = require('./util.js');" },
+  ];
+  const fanIn = buildImportGraph(infos);
+  assert.equal(fanIn.get('util.js'), 3, 'util.js imported by three files');
+});
+
+test('distillRepo: ranks high-fan-in files and reports savings', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-readability-distill-'));
+  try {
+    // A central util imported by two others, padded so it is worth summarizing.
+    const body = Array.from({ length: 40 }, (_, i) => `  step${i}(); // work line ${i}`).join('\n');
+    fs.writeFileSync(path.join(tmpDir, 'util.js'),
+      '/** Core util. */\nexport function run() {\n' + body + '\n}\nexport const VERSION = 1;\n');
+    fs.writeFileSync(path.join(tmpDir, 'a.js'), "import { run } from './util.js';\nrun();\n");
+    fs.writeFileSync(path.join(tmpDir, 'b.js'), "import { run } from './util.js';\nrun();\n");
+
+    const result = distillRepo(tmpDir, { minFanIn: 2, minTokens: 50 });
+    const util = result.candidates.find(c => c.file === 'util.js');
+    assert.ok(util, 'util.js is a candidate');
+    assert.equal(util.fanIn, 2, 'fan-in is 2');
+    assert.ok(util.savedTokens > 0, 'summary saves tokens');
+    assert.ok(util.skeleton.includes('export function run'), 'skeleton keeps the export');
+    assert.ok(result.totals.savedPct > 0, 'totals report a saving');
+
+    const w = writeSummaries(tmpDir, result.candidates);
+    assert.ok(fs.existsSync(path.join(tmpDir, '.ai', 'summaries', 'CONTEXT_MAP.md')), 'writes CONTEXT_MAP.md');
+    assert.ok(fs.existsSync(path.join(tmpDir, '.ai', 'summaries', 'util.js.md')), 'writes per-file summary');
+    assert.equal(w.written, result.candidates.length, 'reports written count');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

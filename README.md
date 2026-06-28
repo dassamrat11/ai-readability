@@ -86,6 +86,7 @@ ai-readability /path/to/any/project
 | `--cost` | Full per-model cost and context window table (14 models, 3 providers) |
 | `--fix` | Auto-write suggested exclusion patterns to `.aiignore` |
 | `--json` | Structured JSON output — for CI pipelines or `jq` |
+| `--respect-gitignore` | Also exclude files matched by the root `.gitignore` (models what a `.gitignore`-aware AI tool actually ingests) |
 | `--watch` | Re-scan and refresh automatically on every file change |
 | `--top <N>` | Show top N files in the bar chart [default: 10] |
 | `--badge [file]` | Write an SVG grade badge [default: `<dir>/ai-readability-badge.svg`] |
@@ -182,6 +183,38 @@ import { scoreRepo, type RepoResult } from 'ai-readability';
 const result: RepoResult = scoreRepo('./src');
 ```
 
+## Context summaries (`distill`)
+
+Some files get pulled into AI context over and over — the ones imported across your codebase. `distill` finds them (by import-graph fan-in × size) and generates a compact **API skeleton** for each: doc comments, exports, signatures, and type/interface contracts, with implementation bodies elided. Feed the summary for cheap context; open the full file only when detail is needed.
+
+```bash
+npx ai-readability distill .            # preview the highest-leverage files
+npx ai-readability distill . --write    # write .ai/summaries/ + CONTEXT_MAP.md
+```
+
+```
+  🧭 Context distillation  .
+  ──────────────────────────────────────────────────────────────────────
+  Candidate                          Imp    Original   Summary   Saved
+  ──────────────────────────────────────────────────────────────────────
+  src/core.js                           4      2,738       425     84%
+  src/pricing.js                        4        918       243     74%
+  ──────────────────────────────────────────────────────────────────────
+  2 file(s)  ·  summarize to save 2,988 tokens (82%)
+```
+
+| Flag | Description |
+|---|---|
+| `--write` | Write `.ai/summaries/<path>.md` + a `CONTEXT_MAP.md` index |
+| `--top <N>` | Max files to summarize [default: 20] |
+| `--min-fanin <N>` | Only files imported by ≥ N others [default: 2] |
+| `--respect-gitignore` | Exclude files matched by `.gitignore` |
+| `--json` | Machine-readable output |
+
+Skeletons are extracted **offline** (no API keys). Extraction is highest-fidelity for JS/TS (signatures, classes, interfaces); other languages get a best-effort declaration extract. Each summary embeds a `source-hash` so you can tell when it's gone stale — regenerate with `distill --write`.
+
+Library API: `import { distillRepo, extractSkeleton, buildImportGraph, writeSummaries } from 'ai-readability'`.
+
 ## CI / CD
 
 ### Auto-update the badge on push
@@ -220,10 +253,13 @@ JSON output schema:
       "name": "Claude Sonnet 4.6",
       "provider": "Anthropic",
       "ctxTokens": 1000000,
+      "tokenFactor": 1.25,
+      "effectiveTokens": 283166,
+      "estimate": true,
       "fits": true,
-      "usagePct": 22.7,
-      "costUsd": 0.679,
-      "costAfterExclusionUsd": 0.014
+      "usagePct": 28.3,
+      "costUsd": 0.849,
+      "costAfterExclusionUsd": 0.018
     }
   ]
 }
@@ -240,6 +276,10 @@ The `--cost` flag compares your repo against 14 models. All prices live in [`src
 | **Google** | Gemini 2.5 Pro, Gemini 2.0 Flash, Gemini 1.5 Pro, Gemini 1.5 Flash |
 
 Prices shown are input/prompt token prices only. Output tokens are not included — for codebase-read use cases, input cost dominates.
+
+### Token counts are cross-tokenizer estimates
+
+Token counting uses [`gpt-tokenizer`](https://www.npmjs.com/package/gpt-tokenizer) (OpenAI BPE). Claude and Gemini tokenize differently, so their token, cost, and context-fit figures are scaled by a calibrated correction factor (Anthropic ≈ 1.25×, Google ≈ 1.10×) and should be treated as **estimates**. OpenAI figures are exact. Factors live in [`src/pricing.js`](src/pricing.js) (`TOKEN_FACTOR`); the JSON output exposes `tokenFactor`, `effectiveTokens`, and an `estimate` flag per model.
 
 ## Privacy
 

@@ -1,5 +1,18 @@
+// Cross-tokenizer correction. We count tokens with gpt-tokenizer (OpenAI BPE).
+// Claude and Gemini tokenize differently, so their effective token counts — and
+// therefore cost and context-window usage — are scaled by a calibrated factor.
+// These are approximations: treat all non-OpenAI figures as estimates.
+//   Anthropic ≈ 1.25× (Claude runs ~20–30% more tokens than GPT on code/English)
+//   Google    ≈ 1.10× (Gemini's SentencePiece is close to, but above, GPT BPE)
+export const TOKEN_FACTOR = { Anthropic: 1.25, OpenAI: 1.0, Google: 1.1 };
+
+// Returns the provider-adjusted token count for a given model.
+export function effectiveTokens(tokens, model) {
+  return Math.round(tokens * (model?.tokenFactor ?? 1));
+}
+
 // prices as of 2026-06, illustrative — verify at provider docs before billing
-export const MODELS = [
+const RAW_MODELS = [
   // Anthropic — platform.claude.com
   { name: 'Claude Opus 4.8',   provider: 'Anthropic', ctx: 1_000_000, usdPerMTok:  5.000 },
   { name: 'Claude Sonnet 4.6', provider: 'Anthropic', ctx: 1_000_000, usdPerMTok:  3.000 },
@@ -18,6 +31,11 @@ export const MODELS = [
   { name: 'Gemini 1.5 Pro',    provider: 'Google',    ctx: 1_048_576, usdPerMTok:  1.250 },
   { name: 'Gemini 1.5 Flash',  provider: 'Google',    ctx: 1_048_576, usdPerMTok:  0.075 },
 ];
+
+export const MODELS = RAW_MODELS.map(m => ({
+  ...m,
+  tokenFactor: TOKEN_FACTOR[m.provider] ?? 1,
+}));
 
 // One model per provider shown in the default context-fit summary.
 // GPT-4o is intentionally 128K (not 1M) — it will show OVERFLOW on mid-sized repos,

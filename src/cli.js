@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-import { scoreText, isGenerated, walk, gradeOf, loadIgnore, GEN_DIRS, reasonFor, computePatterns, writeAiignore } from './core.js';
-import { MODELS, SUMMARY_MODELS } from './pricing.js';
+import { scoreText, isGenerated, walk, gradeOf, loadIgnore, loadGitignore, GEN_DIRS, reasonFor, computePatterns, writeAiignore } from './core.js';
+import { MODELS, SUMMARY_MODELS, effectiveTokens } from './pricing.js';
 import { makeBadge } from './badge.js';
+import { distillRepo, writeSummaries } from './distill.js';
 import fs   from 'node:fs';
 import path from 'node:path';
 import kleur from 'kleur';
@@ -10,6 +11,91 @@ import kleur from 'kleur';
 const argv = process.argv.slice(2);
 const has  = f => argv.includes(f);
 const opt  = f => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null; };
+
+// ── `distill` subcommand ───────────────────────────────────────────────────────
+if (argv[0] === 'distill') runDistill(argv.slice(1));
+
+function runDistill(dargs) {
+  const dhas = f => dargs.includes(f);
+  const dopt = f => { const i = dargs.indexOf(f); return i >= 0 ? dargs[i + 1] : null; };
+  const dpos = dargs.filter((a, i) => !a.startsWith('-') && dargs[i - 1] !== '--top' && dargs[i - 1] !== '--min-fanin');
+  if (!process.stdout.isTTY || dhas('--no-color')) kleur.enabled = false;
+
+  if (dhas('--help') || dhas('-h')) {
+    console.log(`
+  ${kleur.bold('ai-readability distill')}  ·  generate compact context summaries
+
+  ${kleur.bold('Usage')}
+    ai-readability distill [path] [options]
+
+  ${kleur.bold('Options')}
+    --write              Write .ai/summaries/ + CONTEXT_MAP.md
+    --top <N>            Max files to summarize  [default: 20]
+    --min-fanin <N>      Only files imported by ≥ N others  [default: 2]
+    --respect-gitignore  Exclude files matched by .gitignore
+    --json               Machine-readable output
+    --no-color           Disable color
+`);
+    process.exit(0);
+  }
+
+  const root = dpos[0] || '.';
+  const abs = path.resolve(root);
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
+    console.error(kleur.red(`\n  ✗  Not a directory: "${root}"\n`));
+    process.exit(1);
+  }
+
+  const result = distillRepo(root, {
+    top: Math.max(1, parseInt(dopt('--top') ?? '20') || 20),
+    minFanIn: Math.max(1, parseInt(dopt('--min-fanin') ?? '2') || 2),
+    respectGitignore: dhas('--respect-gitignore'),
+  });
+
+  if (dhas('--json')) {
+    // skeletons omitted from JSON unless writing — keep output compact
+    const slim = { ...result, candidates: result.candidates.map(({ skeleton, ...c }) => c) };
+    process.stdout.write(JSON.stringify(slim, null, 2) + '\n');
+    process.exit(0);
+  }
+
+  const n = x => x.toLocaleString();
+  const rule = kleur.dim('  ' + '─'.repeat(68));
+  console.log('\n  ' + kleur.bold(`🧭 Context distillation`) + kleur.dim(`  ${root}`));
+  console.log(rule);
+
+  if (!result.candidates.length) {
+    console.log(kleur.yellow('\n  No high-leverage files found.') +
+      kleur.dim('\n  (need files imported by ≥ min-fanin others, large enough to compress)\n'));
+    process.exit(0);
+  }
+
+  console.log(kleur.dim('  Candidate                          Imp    Original   Summary   Saved'));
+  console.log(rule);
+  for (const c of result.candidates) {
+    console.log(
+      '  ' + c.file.padEnd(34).slice(0, 34) + '  ' +
+      String(c.fanIn).padStart(3) + '   ' +
+      n(c.tokens).padStart(8) + '   ' +
+      n(c.summaryTokens).padStart(7) + '   ' +
+      kleur.green((c.savedPct + '%').padStart(5))
+    );
+  }
+  console.log(rule);
+  const t = result.totals;
+  console.log('  ' + kleur.bold(`${t.files} file(s)`) + `  ·  summarize to save ` +
+    kleur.bold(n(t.savedTokens)) + ` tokens (${t.savedPct}%)`);
+
+  if (dhas('--write')) {
+    const w = writeSummaries(root, result.candidates);
+    console.log('\n  ' + kleur.green(`✅  Wrote ${w.written} summaries → ${path.relative(abs, w.dir) || '.ai/summaries'}/`));
+    console.log('  ' + kleur.dim('Point your AI tool at .ai/summaries/ for cheap context; open the source for detail.'));
+  } else {
+    console.log('\n  ' + kleur.dim('Tip: run with --write to generate .ai/summaries/ (+ CONTEXT_MAP.md).'));
+  }
+  console.log();
+  process.exit(0);
+}
 
 // Exclude values consumed by named flags so they don't land in pos[0] as root
 const pos  = argv.filter((a, i) =>
@@ -21,6 +107,7 @@ const showCost = has('--cost');
 const doFix    = has('--fix');
 const jsonOut  = has('--json');
 const doWatch  = has('--watch');
+const respectGi = has('--respect-gitignore');
 const noColor  = has('--no-color') || !process.stdout.isTTY;
 const topN     = Math.max(1, parseInt(opt('--top') ?? '10') || 10);
 
@@ -46,12 +133,14 @@ if (has('--help') || has('-h')) {
 
   ${kleur.bold('Usage')}
     ai-readability [path] [options]
+    ai-readability distill [path] [options]   Generate compact context summaries
 
   ${kleur.bold('Options')}
     --cost           Show full per-model cost and context window table (14 models)
     --fix            Auto-write suggested patterns to .aiignore
     --json           Machine-readable JSON output  (pipe to jq, CI scripts)
     --watch          Re-scan automatically on file changes
+    --respect-gitignore  Also exclude files matched by .gitignore
     --top <N>        Show top N files by waste  [default: 10]
     --badge [file]   Write an SVG grade badge  [default: <dir>/ai-readability-badge.svg]
     --no-color       Disable color output
@@ -112,12 +201,13 @@ function contextFit(tokens, label) {
     console.log('  ' + kleur.bold('Context fit'));
   }
   for (const m of SUMMARY_MODELS) {
-    const pctNum  = (tokens / m.ctx) * 100;
-    const fits    = tokens <= m.ctx;
+    const eff     = effectiveTokens(tokens, m);
+    const pctNum  = (eff / m.ctx) * 100;
+    const fits    = eff <= m.ctx;
     const pctStr  = pctNum < 1 ? '<1%' : Math.round(pctNum) + '%';
     const ctxStr  = m.ctx >= 1_000_000 ? `${(m.ctx / 1e6).toFixed(0)}M` : `${Math.round(m.ctx / 1000)}K`;
     const nameCol = `${m.name} (${ctxStr})`.padEnd(26);
-    const cost    = tokens / 1e6 * m.usdPerMTok;
+    const cost    = eff / 1e6 * m.usdPerMTok;
     if (fits) {
       console.log(`    ${nameCol}  ${pctStr.padStart(4)}  ${kleur.green('✓')}   ${dollar(cost)}/run`);
     } else {
@@ -128,7 +218,7 @@ function contextFit(tokens, label) {
 
 // ── scan ──────────────────────────────────────────────────────────────────────
 function scan() {
-  const ignore = loadIgnore(root);
+  const ignore = [...loadIgnore(root), ...(respectGi ? loadGitignore(root) : [])];
   return walk(root, ignore).map(f => {
     const rel = path.relative(root, f);
     const s   = scoreText(fs.readFileSync(f, 'utf8'));
@@ -150,9 +240,10 @@ function costTable(tokens, heading) {
       console.log('  ' + kleur.bold(m.provider));
       lastProvider = m.provider;
     }
-    const cost     = tokens / 1e6 * m.usdPerMTok;
-    const usagePct = ((tokens / m.ctx) * 100).toFixed(0);
-    const fits     = tokens <= m.ctx;
+    const eff      = effectiveTokens(tokens, m);
+    const cost     = eff / 1e6 * m.usdPerMTok;
+    const usagePct = ((eff / m.ctx) * 100).toFixed(0);
+    const fits     = eff <= m.ctx;
     const ctxStr   = m.ctx >= 1_000_000
       ? `${(m.ctx / 1e6).toFixed(1)}M tok`
       : `${(m.ctx / 1000).toFixed(0)}K tok`;
@@ -163,6 +254,7 @@ function costTable(tokens, heading) {
     );
   }
   console.log(kleur.dim('\n  * Prices from src/pricing.js — verify at provider docs.'));
+  console.log(kleur.dim('  * Claude/Gemini token & cost figures are cross-tokenizer estimates.'));
 }
 
 // ── main render ───────────────────────────────────────────────────────────────
@@ -189,12 +281,18 @@ function render() {
       files: [...rows].sort((a, b) => b.waste - a.waste),
       flagged,
       savings: { tokensSaved: total - keptTok, tokensAfter: keptTok, pctSaved: Math.round((total - keptTok) / total * 100) },
-      models: MODELS.map(m => ({
-        name: m.name, provider: m.provider, ctxTokens: m.ctx, fits: total <= m.ctx,
-        usagePct: +((total / m.ctx) * 100).toFixed(1),
-        costUsd: +(total / 1e6 * m.usdPerMTok).toFixed(6),
-        costAfterExclusionUsd: +(keptTok / 1e6 * m.usdPerMTok).toFixed(6),
-      })),
+      models: MODELS.map(m => {
+        const eff     = effectiveTokens(total, m);
+        const keptEff = effectiveTokens(keptTok, m);
+        return {
+          name: m.name, provider: m.provider, ctxTokens: m.ctx,
+          tokenFactor: m.tokenFactor, effectiveTokens: eff,
+          estimate: m.tokenFactor !== 1, fits: eff <= m.ctx,
+          usagePct: +((eff / m.ctx) * 100).toFixed(1),
+          costUsd: +(eff / 1e6 * m.usdPerMTok).toFixed(6),
+          costAfterExclusionUsd: +(keptEff / 1e6 * m.usdPerMTok).toFixed(6),
+        };
+      }),
     }, null, 2) + '\n');
     if (resolvedBadge) {
       fs.writeFileSync(resolvedBadge, makeBadge(repoGrade, repoVal));
